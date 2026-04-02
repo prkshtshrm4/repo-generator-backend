@@ -146,9 +146,9 @@ app.get('/api/me', (req, res) => {
 })
 
 app.post('/api/predict', async (req, res) => {
-  const { projectName = '', description = '', tags = [] } = req.body || {}
+  const { projectName = '', tags = [] } = req.body || {}
   const tagList = Array.isArray(tags) ? tags : []
-  const text = [projectName, description, tagList.join(' ')].filter(Boolean).join(' ')
+  const text = `${projectName} ${tagList.join(' ')}`.trim()
 
   try {
     const { data } = await axios.post(
