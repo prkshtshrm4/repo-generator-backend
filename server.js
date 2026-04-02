@@ -215,16 +215,19 @@ app.post('/api/create-repo', requireAuth, async (req, res) => {
     const name = repo.name
     const repoUrl = repo.html_url
 
-    let branch = null
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+
+    const repoInfo = await axios.get(`https://api.github.com/repos/${owner}/${name}`, {
+      headers: authHeaders,
+    })
+    const branch = repoInfo.data.default_branch || 'main'
 
     for (let i = 0; i < files.length; i++) {
       const { path: filePath, content } = files[i]
       const body = {
         message: i === 0 ? `chore: scaffold ${template}` : `chore: add ${filePath}`,
         content: toBase64(content),
-      }
-      if (branch) {
-        body.branch = branch
+        branch,
       }
 
       const pathInUrl = filePath.split('/').map(encodeURIComponent).join('/')
@@ -234,13 +237,6 @@ app.post('/api/create-repo', requireAuth, async (req, res) => {
         body,
         { headers: authHeaders },
       )
-
-      if (!branch) {
-        const info = await axios.get(`https://api.github.com/repos/${owner}/${name}`, {
-          headers: authHeaders,
-        })
-        branch = info.data.default_branch || 'main'
-      }
     }
 
     return res.json({
