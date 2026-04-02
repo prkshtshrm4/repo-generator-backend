@@ -70,11 +70,15 @@ app.get('/auth/github', (req, res) => {
 })
 
 app.get('/auth/github/callback', async (req, res) => {
-  const { code, state } = req.query
+  const { code } = req.query
   if (!code || typeof code !== 'string') {
     return res.status(400).send('Missing code')
   }
-  if (!state || state !== req.session.oauthState) {
+  if (
+    req.query.state &&
+    req.session.oauthState &&
+    req.query.state !== req.session.oauthState
+  ) {
     return res.status(400).send('Invalid state')
   }
   delete req.session.oauthState
