@@ -6,6 +6,8 @@ import axios from 'axios'
 import path from 'path'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
+import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb'
 import { TEMPLATE_STRUCTURES, getFilesToCreate } from './templates.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -17,6 +19,26 @@ const GITHUB_CALLBACK_URL =
   process.env.GITHUB_CALLBACK_URL || `http://localhost:${PORT}/auth/github/callback`
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me'
 const PREDICT_URL = process.env.PREDICT_URL || 'http://localhost:5000/predict'
+
+const REPO_EVENTS_TABLE = '24303909-repo-events'
+const REPO_EVENTS_REGION = 'us-east-1'
+
+const dynamoDoc = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: REPO_EVENTS_REGION }),
+)
+
+async function logRepoCreatedToDynamo(item) {
+  try {
+    await dynamoDoc.send(
+      new PutCommand({
+        TableName: REPO_EVENTS_TABLE,
+        Item: item,
+      }),
+    )
+  } catch (err) {
+    console.error('[repo-events] DynamoDB write failed', err)
+  }
+}
 
 const app = express()
 
@@ -178,7 +200,7 @@ function toBase64(content) {
 }
 
 app.post('/api/create-repo', requireAuth, async (req, res) => {
-  const { repoName, description, template, isPrivate } = req.body || {}
+  const { repoName, description, template, isPrivate, confidence } = req.body || {}
   if (!repoName || typeof repoName !== 'string') {
     return res.status(400).json({ error: 'repoName is required' })
   }
@@ -238,6 +260,26 @@ app.post('/api/create-repo', requireAuth, async (req, res) => {
         { headers: authHeaders },
       )
     }
+
+    const confidenceNum =
+      typeof confidence === 'number' && !Number.isNaN(confidence)
+        ? confidence
+        : typeof confidence === 'string' && confidence !== ''
+          ? Number(confidence)
+          : null
+    const confidenceValue =
+      confidenceNum !== null && !Number.isNaN(confidenceNum) ? confidenceNum : null
+
+    await logRepoCreatedToDynamo({
+      eventId: crypto.randomUUID(),
+      userId: req.session.user?.login ?? 'unknown',
+      repoName: name,
+      template,
+      confidence: confidenceValue,
+      visibility: Boolean(isPrivate) ? 'private' : 'public',
+      repoUrl,
+      timestamp: new Date().toISOString(),
+    })
 
     return res.json({
       repoUrl,
