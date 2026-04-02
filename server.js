@@ -7,7 +7,7 @@ import path from 'path'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb'
 import { TEMPLATE_STRUCTURES, getFilesToCreate } from './templates.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -40,6 +40,31 @@ async function logRepoCreatedToDynamo(item) {
   }
 }
 
+async function scanAllRepoEvents() {
+  const items = []
+  let exclusiveStartKey
+  do {
+    const out = await dynamoDoc.send(
+      new ScanCommand({
+        TableName: REPO_EVENTS_TABLE,
+        ExclusiveStartKey: exclusiveStartKey,
+      }),
+    )
+    if (out.Items?.length) items.push(...out.Items)
+    exclusiveStartKey = out.LastEvaluatedKey
+  } while (exclusiveStartKey)
+  return items
+}
+
+function escapeHtml(s) {
+  if (s == null) return ''
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
 const app = express()
 
 app.set('trust proxy', 1)
@@ -52,6 +77,7 @@ app.use(
 )
 
 app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 
 app.use(
   session({
@@ -75,6 +101,242 @@ function requireAuth(req, res, next) {
   }
   next()
 }
+
+function requireAdmin(req, res, next) {
+  if (!req.session?.isAdmin) {
+    return res.redirect('/admin')
+  }
+  next()
+}
+
+app.get('/admin', (req, res) => {
+  const err = req.query.error === '1'
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin — Repo Generator</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: #0a0a0a;
+      color: #fafafa;
+    }
+    .card {
+      width: 100%;
+      max-width: 360px;
+      padding: 32px 28px;
+      border: 1px solid #27272a;
+      border-radius: 12px;
+      background: #111;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    p.sub { margin: 0 0 24px; font-size: 0.875rem; color: #a1a1aa; }
+    label { display: block; font-size: 0.75rem; color: #71717a; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      margin-bottom: 16px;
+      border: 1px solid #27272a;
+      border-radius: 8px;
+      background: #0a0a0a;
+      color: #fafafa;
+      font-size: 0.9375rem;
+    }
+    input:focus { outline: none; border-color: #52525b; }
+    button {
+      width: 100%;
+      padding: 12px;
+      margin-top: 8px;
+      border: none;
+      border-radius: 8px;
+      background: #fafafa;
+      color: #0a0a0a;
+      font-weight: 600;
+      font-size: 0.9375rem;
+      cursor: pointer;
+    }
+    button:hover { background: #fff; }
+    .err { margin: 0 0 16px; padding: 10px 12px; border-radius: 8px; background: rgba(239, 68, 68, 0.12); color: #fca5a5; font-size: 0.875rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Admin login</h1>
+    <p class="sub">Repo Generator dashboard</p>
+    ${err ? '<p class="err">Invalid username or password.</p>' : ''}
+    <form method="post" action="/admin/login" autocomplete="off">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" required />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required />
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>`)
+})
+
+app.post('/admin/login', (req, res) => {
+  const { username, password } = req.body || {}
+  if (username === 'admin' && password === 'admin') {
+    req.session.isAdmin = true
+    return res.redirect('/admin/dashboard')
+  }
+  return res.redirect('/admin?error=1')
+})
+
+app.get('/admin/logout', (req, res) => {
+  delete req.session.isAdmin
+  res.redirect('/admin')
+})
+
+app.get('/admin/dashboard', requireAdmin, async (req, res) => {
+  let items = []
+  try {
+    items = await scanAllRepoEvents()
+  } catch (err) {
+    console.error('[admin] DynamoDB scan failed', err)
+  }
+
+  items.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
+
+  const total = items.length
+  const rows = items
+    .map((ev) => {
+      const url = ev.repoUrl ? String(ev.repoUrl) : ''
+      const safeUrl = escapeHtml(url)
+      const link = url
+        ? `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeUrl}</a>`
+        : '—'
+      const conf =
+        ev.confidence != null && ev.confidence !== '' && !Number.isNaN(Number(ev.confidence))
+          ? escapeHtml(String(ev.confidence))
+          : '—'
+      return `<tr>
+  <td>${escapeHtml(ev.timestamp)}</td>
+  <td>${escapeHtml(ev.userId)}</td>
+  <td>${escapeHtml(ev.repoName)}</td>
+  <td>${escapeHtml(ev.template)}</td>
+  <td>${conf}</td>
+  <td>${escapeHtml(ev.visibility)}</td>
+  <td class="url">${link}</td>
+</tr>`
+    })
+    .join('\n')
+
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Admin dashboard — Repo Generator</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px 20px 48px;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: #0a0a0a;
+      color: #fafafa;
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 28px;
+      max-width: 1400px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 { margin: 0; font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
+    .stat {
+      font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+      font-size: 0.875rem;
+      color: #a1a1aa;
+    }
+    .stat strong { color: #fafafa; font-size: 1.1rem; }
+    a.logout {
+      color: #a1a1aa;
+      text-decoration: none;
+      font-size: 0.875rem;
+    }
+    a.logout:hover { color: #fafafa; }
+    .wrap { max-width: 1400px; margin: 0 auto; overflow-x: auto; border: 1px solid #27272a; border-radius: 10px; background: #111; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+      font-size: 0.75rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid #1f1f23;
+      vertical-align: top;
+    }
+    th {
+      color: #71717a;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 0.65rem;
+      background: #0c0c0c;
+    }
+    tr:last-child td { border-bottom: none; }
+    td.url a { color: #86efac; word-break: break-all; }
+    td.url a:hover { text-decoration: underline; }
+    .empty { padding: 48px; text-align: center; color: #71717a; font-family: ui-sans-serif, system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Repo events</h1>
+      <p class="stat">Total repos created: <strong>${total}</strong></p>
+    </div>
+    <a class="logout" href="/admin/logout">Log out</a>
+  </header>
+  <div class="wrap">
+    ${
+      total === 0
+        ? '<p class="empty">No events yet (or DynamoDB scan failed — check server logs).</p>'
+        : `<table>
+  <thead>
+    <tr>
+      <th>Timestamp</th>
+      <th>User</th>
+      <th>Repo</th>
+      <th>Template</th>
+      <th>Confidence</th>
+      <th>Visibility</th>
+      <th>URL</th>
+    </tr>
+  </thead>
+  <tbody>
+${rows}
+  </tbody>
+</table>`
+    }
+  </div>
+</body>
+</html>`)
+})
 
 app.get('/auth/github', (req, res) => {
   if (!GITHUB_CLIENT_ID) {
